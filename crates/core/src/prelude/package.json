@@ -3,9 +3,12 @@
   "version": "1.1.1",
   "description": "typescript definitions for the extism js-pdk",
   "types": "dist/index.d.ts",
-  "files": ["dist/*.d.ts", "types/*.d.ts"],
+  "files": [
+    "dist/*.d.ts",
+    "types/*.d.ts"
+  ],
   "scripts": {
-    "build": "node esbuild.js && tsc"
+    "build": "node esbuild.js && tsc && dts-bundle-generator --config dts-bundle-generator.config.js"
   },
   "author": "The Extism Authors <oss@extism.org>",
   "license": "BSD-Clause-3",
@@ -14,8 +17,9 @@
   },
   "devDependencies": {
     "core-js": "^3.30.2",
+    "dts-bundle-generator": "^9.5.1",
     "esbuild": "^0.17.19",
-    "typescript": "^5.4.5"
+    "typescript": "5.4.5"
   },
   "exports": {
     ".": {

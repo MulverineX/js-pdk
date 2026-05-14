@@ -1,143 +1,90 @@
-use rquickjs::{
-    function::Args, object::ObjectKeysIter, Context, Ctx, Function, Object, Runtime, Undefined,
-    Value,
-};
-use std::io;
-use std::io::Read;
+use quickjs_runtime::builder::QuickJsRuntimeBuilder;
+use quickjs_runtime::facades::QuickJsRuntimeFacade;
+use quickjs_runtime::jsutils::{JsError, Script};
+use quickjs_runtime::quickjs_utils::{functions, objects};
+use quickjs_runtime::quickjsrealmadapter::QuickJsRealmAdapter;
+use quickjs_runtime::quickjsruntimeadapter::QuickJsRuntimeAdapter;
+use quickjs_runtime::quickjsvalueadapter::QuickJsValueAdapter;
+use quickjs_runtime::values::JsValueFacade;
+use std::io::{self, Read};
 
 mod globals;
 
-struct Cx(Context);
+static RUNTIME: std::sync::OnceLock<QuickJsRuntimeFacade> = std::sync::OnceLock::new();
+static CALL_ARGS: std::sync::Mutex<Vec<Vec<JsValueFacade>>> = std::sync::Mutex::new(vec![]);
 
-unsafe impl Send for Cx {}
-unsafe impl Sync for Cx {}
-
-static CONTEXT: std::sync::OnceLock<Cx> = std::sync::OnceLock::new();
-static CALL_ARGS: std::sync::Mutex<Vec<Vec<ArgType>>> = std::sync::Mutex::new(vec![]);
-
-fn caught_to_string(caught: Value) -> String {
-    match caught.as_exception() {
-        Some(err) => {
-            let msg = err.message().unwrap_or_default();
-            format!("Exception: {}\n{}", msg, err.stack().unwrap_or_default())
-        }
-        None => {
-            // The caught value is not a JS Error object. It could be a string,
-            // number, null, or an uninitialized value from an async context.
-            format!("Exception: {:?}", caught)
-        }
-    }
+fn js_error_to_string(err: JsError) -> String {
+    format!("{}\n{}", err.get_message(), err.get_stack())
 }
 
-fn err_into_string(this: &Ctx, err: rquickjs::Error) -> String {
-    match err {
-        rquickjs::Error::Exception => caught_to_string(this.catch()),
-        err => err.to_string(),
-    }
+fn invoke(idx: i32) -> Result<JsValueFacade, JsError> {
+    let call_args = CALL_ARGS.lock().unwrap().pop().unwrap();
+    let rt = RUNTIME.get().expect("Runtime not initialized");
+
+    rt.loop_realm_sync(None, move |_rt: &QuickJsRuntimeAdapter, realm: &QuickJsRealmAdapter| {
+        // Convert args from JsValueFacade to QuickJsValueAdapter
+        let args: Vec<QuickJsValueAdapter> = call_args
+            .into_iter()
+            .filter_map(|facade| realm.from_js_value_facade(facade).ok())
+            .collect();
+
+        // Get module.exports
+        let global = realm.get_global()?;
+        let module = objects::get_property_q(realm, &global, "module")?;
+        let exports = objects::get_property_q(realm, &module, "exports")?;
+
+        // Get export names and sort them
+        let export_names = get_export_names(realm, &exports)?;
+        let export_name = export_names.get(idx as usize).ok_or_else(|| {
+            JsError::new_string(format!("Export index {} out of range", idx))
+        })?;
+
+        // Get the function
+        let func = objects::get_property_q(realm, &exports, export_name)?;
+
+        // Call the function
+        let result = functions::call_function_q(realm, &func, &args, None)?;
+
+        // Check for exception
+        if result.is_exception() {
+            unsafe {
+                if let Some(ex_err) = QuickJsRealmAdapter::get_exception(realm.context) {
+                    return Err(ex_err);
+                }
+            }
+            return Err(JsError::new_string("Function call failed with exception".to_string()));
+        }
+
+        realm.to_js_value_facade(&result)
+    })
+}
+
+fn get_export_names(realm: &QuickJsRealmAdapter, exports: &QuickJsValueAdapter) -> Result<Vec<String>, JsError> {
+    objects::get_property_names_q(realm, exports)
 }
 
 #[export_name = "wizer.initialize"]
 extern "C" fn init() {
-    let runtime = Runtime::new().expect("Couldn't make a runtime");
-    let context = Context::full(&runtime).expect("Couldnt make a context");
-    globals::inject_globals(&context).expect("Failed to initialize globals");
+    let rt = QuickJsRuntimeBuilder::new().build();
+    let _ = RUNTIME.set(rt);
 
+    let rt = RUNTIME.get().expect("Runtime not initialized");
+
+    // Read JS code from stdin
     let mut code = String::new();
     io::stdin().read_to_string(&mut code).unwrap();
 
-    context
-        .with(|this| -> Result<rquickjs::Undefined, anyhow::Error> {
-            if let Err(err) = this.eval::<(), _>(code) {
-                panic!("{}", err_into_string(&this, err).to_string());
-            }
+    // Inject globals and eval code
+    rt.loop_realm_sync(None, move |_rt: &QuickJsRuntimeAdapter, realm: &QuickJsRealmAdapter| {
+        globals::inject_globals(realm).map_err(|e| JsError::new_string(format!("Failed to inject globals: {}", e)))?;
 
-            Ok(Undefined)
-        })
-        .unwrap();
-    let _ = CONTEXT.set(Cx(context));
-}
+        // Eval the user code
+        realm.eval(Script::new("input.js", &code)).map_err(|e| {
+            JsError::new_string(format!("Eval failed: {}", e.get_message()))
+        })?;
 
-fn js_context() -> Context {
-    if CONTEXT.get().is_none() {
-        init()
-    }
-    let context = CONTEXT.get().unwrap();
-    context.0.clone()
-}
-
-fn invoke<'a, T, F: for<'b> Fn(Ctx<'b>, Value<'b>) -> T>(
-    idx: i32,
-    conv: F,
-) -> Result<T, anyhow::Error> {
-    let call_args = CALL_ARGS.lock().unwrap().pop();
-    let context = js_context();
-    context.with(|ctx| {
-        let call_args = call_args.unwrap();
-        let args: Args = call_args.iter().fold(
-            Args::new(ctx.clone(), call_args.len()),
-            |mut args, rust_arg| {
-                match rust_arg {
-                    ArgType::I32(v) => args
-                        .push_arg(v)
-                        .expect("Should be able to convert i32 to JS arg"),
-                    ArgType::I64(v) => args
-                        .push_arg(rquickjs::BigInt::from_i64(ctx.clone(), *v))
-                        .expect("Should be able to convert i64 to JS arg"),
-                    ArgType::F32(v) => args
-                        .push_arg(v)
-                        .expect("Should be able to convert f32 to JS arg"),
-                    ArgType::F64(v) => args
-                        .push_arg(v)
-                        .expect("Should be able to convert f64 to JS arg"),
-                }
-                args
-            },
-        );
-        let global = ctx.globals();
-
-        let module: Object = global.get("module")?;
-        let exports: Object = module.get("exports")?;
-
-        let export_names = export_names(exports.clone()).unwrap();
-
-        let function: Function = exports.get(export_names[idx as usize].as_str()).unwrap();
-
-        let function_invocation_result = function.call_arg(args);
-
-        // If the function call failed, catch the exception now before
-        // execute_pending_job() can consume or overwrite it.
-        let call_err = if function_invocation_result.is_err() {
-            Some(ctx.catch())
-        } else {
-            None
-        };
-
-        while ctx.execute_pending_job() {
-            continue;
-        }
-
-        match function_invocation_result {
-            Ok(r) => {
-                let res = conv(ctx.clone(), r);
-                Ok(res)
-            }
-            Err(err) => {
-                // Use the exception we caught earlier (before execute_pending_job
-                // could overwrite it).
-                let s = match call_err {
-                    Some(caught) if !caught.is_null() && !caught.is_undefined() => {
-                        caught_to_string(caught)
-                    }
-                    _ => err_into_string(&ctx, err),
-                };
-                let mem = extism_pdk::Memory::from_bytes(&s).unwrap();
-                unsafe {
-                    extism_pdk::extism::error_set(mem.offset());
-                }
-                Err(anyhow::Error::msg(s))
-            }
-        }
-    })
+        Ok::<(), JsError>(())
+    }).expect("Initialization failed");
 }
 
 #[no_mangle]
@@ -152,7 +99,7 @@ pub extern "C" fn __arg_i32(arg: i32) {
         .unwrap()
         .last_mut()
         .unwrap()
-        .push(ArgType::I32(arg));
+        .push(JsValueFacade::I32 { val: arg });
 }
 
 #[no_mangle]
@@ -162,7 +109,7 @@ pub extern "C" fn __arg_i64(arg: i64) {
         .unwrap()
         .last_mut()
         .unwrap()
-        .push(ArgType::I64(arg));
+        .push(JsValueFacade::F64 { val: arg as f64 });
 }
 
 #[no_mangle]
@@ -172,7 +119,7 @@ pub extern "C" fn __arg_f32(arg: f32) {
         .unwrap()
         .last_mut()
         .unwrap()
-        .push(ArgType::F32(arg));
+        .push(JsValueFacade::F64 { val: arg as f64 });
 }
 
 #[no_mangle]
@@ -182,57 +129,61 @@ pub extern "C" fn __arg_f64(arg: f64) {
         .unwrap()
         .last_mut()
         .unwrap()
-        .push(ArgType::F64(arg));
+        .push(JsValueFacade::F64 { val: arg });
 }
 
 #[no_mangle]
 pub extern "C" fn __invoke_i32(idx: i32) -> i32 {
-    invoke(idx, |_ctx, r| r.as_number().unwrap_or_default() as i32).unwrap_or(-1)
+    match invoke(idx) {
+        Ok(v) => v.get_i32(),
+        Err(e) => {
+            let mem = extism_pdk::Memory::from_bytes(&js_error_to_string(e)).unwrap();
+            unsafe { extism_pdk::extism::error_set(mem.offset()) }
+            -1
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn __invoke_i64(idx: i32) -> i64 {
-    invoke(idx, |_ctx, r| {
-        if let Some(number) = r.as_big_int() {
-            return number.clone().to_i64().unwrap_or_default();
-        } else if let Some(number) = r.as_number() {
-            return number as i64;
+    match invoke(idx) {
+        Ok(v) => v.get_i64(),
+        Err(e) => {
+            let mem = extism_pdk::Memory::from_bytes(&js_error_to_string(e)).unwrap();
+            unsafe { extism_pdk::extism::error_set(mem.offset()) }
+            -1
         }
-        0
-    })
-    .unwrap_or(-1)
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn __invoke_f64(idx: i32) -> f64 {
-    invoke(idx, |_ctx, r| r.as_float().unwrap_or_default()).unwrap_or(-1.0)
+    match invoke(idx) {
+        Ok(v) => v.get_f64(),
+        Err(e) => {
+            let mem = extism_pdk::Memory::from_bytes(&js_error_to_string(e)).unwrap();
+            unsafe { extism_pdk::extism::error_set(mem.offset()) }
+            -1.0
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn __invoke_f32(idx: i32) -> f32 {
-    invoke(idx, |_ctx, r| r.as_number().unwrap_or_default() as f32).unwrap_or(-1.0)
+    match invoke(idx) {
+        Ok(v) => v.get_f64() as f32,
+        Err(e) => {
+            let mem = extism_pdk::Memory::from_bytes(&js_error_to_string(e)).unwrap();
+            unsafe { extism_pdk::extism::error_set(mem.offset()) }
+            -1.0
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn __invoke(idx: i32) {
-    invoke(idx, |_ctx, _r| ()).unwrap()
-}
-
-fn export_names(exports: Object) -> anyhow::Result<Vec<String>> {
-    let mut keys_iter: ObjectKeysIter<String> = exports.keys();
-    let mut key = keys_iter.next();
-    let mut keys: Vec<String> = vec![];
-    while key.is_some() {
-        keys.push(key.unwrap()?.to_string());
-        key = keys_iter.next();
+    if let Err(e) = invoke(idx) {
+        let mem = extism_pdk::Memory::from_bytes(&js_error_to_string(e)).unwrap();
+        unsafe { extism_pdk::extism::error_set(mem.offset()) }
     }
-    keys.sort();
-    Ok(keys)
-}
-
-enum ArgType {
-    I32(i32),
-    I64(i64),
-    F32(f32),
-    F64(f64),
 }

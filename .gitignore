@@ -2,3 +2,5 @@
 wasi-sdk
 *.wasm
 .venv
+quickjs_es_runtime_temp/
+rquickjs_temp/
